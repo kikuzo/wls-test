@@ -1,9 +1,13 @@
+from __future__ import annotations
+
 import os
 import sys
 import json
 import time
+import threading
 import requests
 from requests.auth import HTTPBasicAuth
+from flask import Flask, jsonify, request
 
 # 高火力 DOK API のベースURL
 API_BASE_URL = "https://secure.sakura.ad.jp/cloud/zone/is1a/api/managed-container/1.0"
@@ -13,6 +17,8 @@ API_BASE_URL = "https://secure.sakura.ad.jp/cloud/zone/is1a/api/managed-containe
 #   ACCESS TOKEN SECRET   -> SAKURA_CLOUD_ACCESS_TOKEN_SECRET
 ACCESS_TOKEN = os.getenv("SAKURA_CLOUD_ACCESS_TOKEN")
 ACCESS_TOKEN_SECRET = os.getenv("SAKURA_CLOUD_ACCESS_TOKEN_SECRET")
+
+app = Flask(__name__)
 
 
 def get_cloud_account_info():
@@ -105,7 +111,7 @@ def wait_for_task_completion(task_id: str, check_interval: int = 10):
     check_interval : int
         チェック間隔（秒）。デフォルト：10秒
     """
-    print(f"\n=== wait_for_task_completion ===")
+    print("\n=== wait_for_task_completion ===")
     print(f"タスク完了を待機中... (check_interval={check_interval}秒)")
 
     while True:
@@ -118,7 +124,7 @@ def wait_for_task_completion(task_id: str, check_interval: int = 10):
 
             # statusが'waiting'以外になったら終了
             if status != 'waiting':
-                print(f"\n=== Task completed ===")
+                print("\n=== Task completed ===")
                 print(f"status: {status}")
                 print(json.dumps(task_info, ensure_ascii=False, indent=2))
                 break
@@ -181,7 +187,13 @@ def cancel_task(task_id: str):
     return response.json()
 
 
-def register_task(name: str, image: str, command: list[str], http_port: int):
+def register_task(
+    name: str,
+    image: str,
+    command: list[str],
+    http_port: int,
+    status_callback: str | None = None,
+):
     """
     高火力 DOK にタスクを登録する。
     POST /tasks/
@@ -196,6 +208,8 @@ def register_task(name: str, image: str, command: list[str], http_port: int):
         コンテナ内で実行するコマンド（例: ['/bin/sh', '-c', 'env']）
     http_port : int
         公開する HTTP ポート番号（例: 80）
+    status_callback : str | None
+        タスク状態のコールバック先URL
     """
     if not ACCESS_TOKEN or not ACCESS_TOKEN_SECRET:
         raise RuntimeError(
@@ -209,7 +223,7 @@ def register_task(name: str, image: str, command: list[str], http_port: int):
     # - name
     # - containers (ContainerDefinition の配列)
     # - tags（文字列配列）
-    # - execution_time_limit_sec（null 可）:contentReference[oaicite:1]{index=1}
+    # - execution_time_limit_sec（null 可）
     payload = {
         "name": name,
         "containers": [
@@ -229,6 +243,8 @@ def register_task(name: str, image: str, command: list[str], http_port: int):
         "tags": ["example"],
         "execution_time_limit_sec": None,
     }
+    if status_callback:
+        payload["status_callback"] = status_callback
 
     try:
         response = requests.post(
@@ -252,77 +268,87 @@ def register_task(name: str, image: str, command: list[str], http_port: int):
     return response.json()
 
 
-def main():
-    # 1. アカウント情報取得
-    print("=== get_cloud_account_info ===")
-    info = get_cloud_account_info()
-    print(json.dumps(info, ensure_ascii=False, indent=2))
+def _normalize_callback_url(status_callback: str) -> str:
+    if "://" not in status_callback:
+        return f"http://{status_callback}"
+    return status_callback
 
-    # 2. タスク登録（サンプルパラメータをコード内に埋め込み）
-    #task_name = "sample-nginx-task"
-    #image = "nginx:latest"
-    #command = ["/bin/sh", "-c", "env"]
-    #http_port = 80
 
-    # 2. タスク登録（サンプルパラメータをコード内に埋め込み）
-    task_name = "openai-gptoss-task"
-    image = "vllm/vllm-openai:gptoss"
-    #command = ["--model openai/gpt-oss-20b --gpu-memory-utilization 0.95"]
-    command = ["--model openai/gpt-oss-20b"]
-    http_port = 8000
+def _post_status_callback(status_callback: str, task_id: str, status: str) -> None:
+    callback_url = _normalize_callback_url(status_callback)
+    try:
+        requests.post(
+            callback_url,
+            json={"task_id": task_id, "status": status},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"[WARN] status_callback failed: {e}", file=sys.stderr)
 
-    print("\n=== register_task ===")
-    print(f"Task name : {task_name}")
-    print(f"Image     : {image}")
-    print(f"Command   : {command}")
-    print(f"HTTP port : {http_port}")
 
-    task = register_task(
-        name=task_name,
-        image=image,
-        command=command,
-        http_port=http_port,
-    )
-
-    print("\n=== created task ===")
-    print(json.dumps(task, ensure_ascii=False, indent=2))
-
-    # よく使いそうな情報を少しだけ抜き出して表示
-    print("\n=== task summary ===")
-    task_id = task.get('id')
-    print(f"task_id : {task_id}")
-    print(f"status  : {task.get('status')}")
-    print(f"http_uri: {task.get('http_uri')}")
-
-    # 3. タスク情報取得を繰り返す（statusがwaiting以外になるまで）
-    if task_id:
-        wait_for_task_completion(task_id)
-
-        # 4. 10秒スリープ後、タスク情報を再取得
-        print(f"\n=== sleep 10 seconds ===")
-        time.sleep(10)
-
-        # 5. タスク情報を取得し、statusがrunningの場合はキャンセル
-        print(f"\n=== check task status and cancel if running ===")
+def _watch_task_status(task_id: str, status_callback: str, check_interval: int = 10) -> None:
+    while True:
         try:
             task_info = get_task_info(task_id)
-            status = task_info.get('status')
-            print(f"Current status: {status}")
+            status = task_info.get("status")
+            if status == "running":
+                http_uri = task_info.get("http_uri")
+                print(f"[INFO] Task running: task_id={task_id}, http_uri={http_uri}")
+            _post_status_callback(status_callback, task_id, status)
 
-            if status == 'running':
-                print(f"Canceling task...")
-                canceled_task = cancel_task(task_id)
-                print(f"\n=== task canceled ===")
-                print(json.dumps(canceled_task, ensure_ascii=False, indent=2))
-            else:
-                print(f"Task is not running (status={status}). No cancellation needed.")
+            if status != "waiting":
+                break
+
+            time.sleep(check_interval)
         except Exception as e:
-            print(f"[WARN] タスク情報取得またはキャンセルに失敗しました: {e}", file=sys.stderr)
+            print(f"[WARN] タスク情報取得に失敗しました: {e}", file=sys.stderr)
+            break
+
+
+@app.post("/register_task")
+def register_task_api():
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({"error": "Invalid or missing JSON payload"}), 400
+
+    task_name = payload.get("task_name")
+    image = payload.get("image")
+    command = payload.get("command")
+    http_port = payload.get("http_port")
+    status_callback = payload.get("status_callback")
+
+    if not task_name or not image or command is None or http_port is None:
+        return jsonify({"error": "Missing required fields"}), 400
+
+    try:
+        task = register_task(
+            name=task_name,
+            image=image,
+            command=command,
+            http_port=http_port,
+            status_callback=status_callback,
+        )
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    if status_callback and task.get("status") == "waiting":
+        task_id = task.get("id")
+        if task_id:
+            thread = threading.Thread(
+                target=_watch_task_status,
+                args=(task_id, status_callback),
+                daemon=True,
+            )
+            thread.start()
+
+    return jsonify(task), 200
+
+
+@app.post("/cancel_task")
+def cancel_task_api():
+    _ = request.get_json(silent=True)
+    return jsonify({"status": "not_implemented"}), 501
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        print(f"[ERROR] {e}", file=sys.stderr)
-        sys.exit(1)
+    app.run(host="0.0.0.0", port=8081)
