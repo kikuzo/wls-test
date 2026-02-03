@@ -116,7 +116,7 @@ def watch_task_status(container_id: str, timeout: Optional[int] = None, poll_int
       time.sleep(poll_interval)
 
 
-def stop_server() -> None:
+def cancel_task() -> None:
     """vllm-openai コンテナを停止・削除する。
     
     `docker stop vllm-openai` と `docker rm vllm-openai` を実行する。
