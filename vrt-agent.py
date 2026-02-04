@@ -25,15 +25,28 @@ def _strip_ansi_codes(text: str) -> str:
     return ansi_escape.sub('', text)
 
 
-def register_task(timeout: Optional[int] = None) -> str:
-    """vllm 用の Docker コンテナを起動し、コンテナ ID を返す。
+def register_task(
+    name: str,
+    image: str,
+    command: list[str],
+    http_port: int,
+    status_callback: str | None = None,
+) -> str:
+    """高火力 DOK にタスクを登録する。
+    POST /tasks/
 
-    実行するコマンド（sudo 不要を想定）:
-      docker run -d --gpus all -p 8000:8000 --ipc=host \
-        vllm/vllm-openai:gptoss --model openai/gpt-oss-20b
-
-    引数:
-      timeout: docker コマンドのタイムアウト（秒）、省略可。
+    Parameters
+    ----------
+    name : str
+        タスク名
+    image : str
+        コンテナイメージ（例: 'nginx:latest'）
+    command : list[str]
+        コンテナ内で実行するコマンド（例: ['/bin/sh', '-c', 'env']）
+    http_port : int
+        公開する HTTP ポート番号（例: 80）
+    status_callback : str | None
+        タスク状態のコールバック先URL
 
     返り値:
       起動に成功した場合はコンテナ ID の文字列を返す。
@@ -50,15 +63,13 @@ def register_task(timeout: Optional[int] = None) -> str:
       "--gpus",
       "all",
       "-p",
-      "8000:8000",
+      f"{http_port}:{http_port}",
       "--ipc=host",
-      "vllm/vllm-openai:gptoss",
-      "--model",
-      "openai/gpt-oss-20b",
-    ]
+      image,
+    ] + command
 
     _LOGGER.info("Starting docker container: %s", " ".join(cmd))
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, timeout=None)
 
     if result.returncode != 0:
         _LOGGER.error("Docker run failed: %s", result.stderr.strip())
